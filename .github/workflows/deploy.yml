@@ -1,75 +1,147 @@
-name: Build and Push to ECR, then Deploy to ECS
+```yaml
+name: Java Application Automated Deployment
 
 on:
   push:
     branches:
       - main
 
+# GitHub OIDC permissions
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: java-app
+  ECS_CLUSTER: java-app-cluster
+  ECS_SERVICE: java-app-service
+
 jobs:
-  build-push-deploy:
+
+  # ==========================================
+  # 1. BUILD AND TEST
+  # ==========================================
+  build-test:
+
     runs-on: ubuntu-latest
 
-    env:
-      AWS_REGION: ap-south-1
-      ECR_REPOSITORY: devops-project8
-      ECS_SERVICE: devops-project8-service     # Target ECS Service Name
-      ECS_CLUSTER: devops-project8-cluster     # Target ECS Cluster Name
-      CONTAINER_NAME: devops-project8          # Matches your console container name
-
     steps:
-      - name: Checkout code
+
+      - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '21'
+          distribution: temurin
+          java-version: '17'
           cache: maven
 
-      - name: Build Maven application (Generate Jar)
-        run: mvn clean package -DskipTests
+      - name: Build and test Maven application
+        run: |
+          mvn clean test package
 
-      - name: Configure AWS credentials (via Secure Secrets)
+
+  # ==========================================
+  # 2. DEPLOY TO AWS
+  # ==========================================
+  deploy:
+
+    needs: build-test
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ----------------------------------------
+      # CHECKOUT SOURCE CODE
+      # ----------------------------------------
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+
+      # ----------------------------------------
+      # CONFIGURE AWS USING GITHUB OIDC
+      # ----------------------------------------
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+
+      # ----------------------------------------
+      # VERIFY AWS AUTHENTICATION
+      # ----------------------------------------
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+
+      # ----------------------------------------
+      # LOGIN TO AMAZON ECR
+      # ----------------------------------------
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+
+      # ----------------------------------------
+      # BUILD DOCKER IMAGE
+      # ----------------------------------------
       - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          docker build -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
 
-      - name: Tag and Push Docker image to Amazon ECR
-        id: build-image
+
+      # ----------------------------------------
+      # PUSH DOCKER IMAGE TO ECR
+      # ----------------------------------------
+      - name: Push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          docker tag ${{ env.ECR_REPOSITORY }}:${{ github.sha }} $REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-          docker push $REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-          echo "image=$REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Download active task definition from AWS ECS
+
+      # ----------------------------------------
+      # DEPLOY TO ECS
+      # ----------------------------------------
+      - name: Deploy to ECS
         run: |
-          # 🟢 Fixed: Changed --task-definition family query to match your actual console name
-          aws ecs describe-task-definition --task-definition devops-project8-task --query taskDefinition > task-definition.json
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment
 
-      - name: Fill in the new image ID in the Amazon ECS task definition
-        id: render-task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: task-definition.json
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.build-image.outputs.image }}
 
-      - name: Deploy Amazon ECS task definition
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+      # ----------------------------------------
+      # WAIT FOR ECS DEPLOYMENT
+      # ----------------------------------------
+      - name: Wait for ECS deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
+
+      # ----------------------------------------
+      # SUCCESS
+      # ----------------------------------------
+      - name: Deployment successful
+        run: |
+          echo "=========================================="
+          echo "AWS AUTHENTICATION SUCCESSFUL"
+          echo "ECR PUSH SUCCESSFUL"
+          echo "ECS DEPLOYMENT SUCCESSFUL"
+          echo "=========================================="
+          echo "Commit: ${{ github.sha }}"
+```
+
