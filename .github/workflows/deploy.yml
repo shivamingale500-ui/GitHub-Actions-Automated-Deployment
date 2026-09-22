@@ -1,0 +1,75 @@
+name: Build and Push to ECR, then Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ap-south-1
+      ECR_REPOSITORY: devops-project8
+      ECS_SERVICE: devops-project8-service     # Target ECS Service Name
+      ECS_CLUSTER: devops-project8-cluster     # Target ECS Cluster Name
+      CONTAINER_NAME: devops-project8          # Matches your console container name
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: maven
+
+      - name: Build Maven application (Generate Jar)
+        run: mvn clean package -DskipTests
+
+      - name: Configure AWS credentials (via Secure Secrets)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+
+      - name: Tag and Push Docker image to Amazon ECR
+        id: build-image
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ github.sha }} $REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push $REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          echo "image=$REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Download active task definition from AWS ECS
+        run: |
+          # 🟢 Fixed: Changed --task-definition family query to match your actual console name
+          aws ecs describe-task-definition --task-definition devops-project8-task --query taskDefinition > task-definition.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
